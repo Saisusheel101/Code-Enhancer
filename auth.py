@@ -54,7 +54,7 @@ def init_db():
     )
     ''')
     
-    # Create user_activity table for tracking login attempts
+    # Create user_activity table for tracking login attempt
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS user_activity (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
