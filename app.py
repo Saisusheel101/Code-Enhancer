@@ -11,13 +11,10 @@ from typing import Dict, Any, List, Optional
 import re
 import random
 import openai
-from flask import Flask, request, jsonify, render_template, session, redirect, url_for, flash, g
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, flash
 import logging
 from cachetools import TTLCache
-from flask import request, jsonify
 from dotenv import load_dotenv
-import html
-import traceback
 from werkzeug.middleware.proxy_fix import ProxyFix
 from ratelimit import limits, RateLimitException
 from datetime import datetime
@@ -25,9 +22,7 @@ from datetime import datetime
 # Import authentication module
 import auth
 from auth import login_required, UserAuth
-# Add these imports at the top of your app.py file
 import room
-from flask_socketio import SocketIO, join_room, leave_room, emit
 from communications import socketio
 
 # Create database directory if it doesn't exist
@@ -46,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Initialize the app first
 app = Flask(__name__, template_folder='templates')
 app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
-app.config['MAX_CONTENT_Length'] = 1 * 1024 * 1024  # 1MB max-limit
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max-limit
 app.config['MAX_CACHE_SIZE'] = 1000  # 1000 questions in cache
 app.config['CACHE_TTL'] = 3600  # 1 hour TTL
 app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
@@ -65,9 +60,33 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Constants
 RATE_LIMIT_MINUTE = 30  # API calls per minute
+VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+MAX_CODE_SIZE = 50000  # 50KB
+RESTRICTED_CODE_PATTERNS = (
+    "import os",
+    "import subprocess",
+    "import sys",
+    "from os import",
+    "from subprocess import",
+    "from sys import",
+    "__import__('os')",
+    "__import__('subprocess')",
+    "eval(",
+    "exec(",
+)
+DB_CHECK_INTERVAL_SECONDS = 60
+last_db_check_at = 0.0
 
 # Use a proper cache with expiration
 questions_db = TTLCache(maxsize=app.config['MAX_CACHE_SIZE'], ttl=app.config['CACHE_TTL'])
+
+
+# This function checks user-submitted code for unsafe commands
+# (for example: system access, shell commands, or dynamic code execution).
+# If any restricted pattern is found, we stop execution for safety.
+def _is_restricted_code(code: str) -> bool:
+    """Return True when code contains restricted patterns."""
+    return any(pattern in code for pattern in RESTRICTED_CODE_PATTERNS)
 
 def initialize_databases():
     """Ensure all database tables are created"""
@@ -92,9 +111,15 @@ def format_datetime_filter(value, format="%Y-%m-%d %H:%M:%S"):
             return value
     return value.strftime(format)
 
+# We periodically verify that required database tables still exist.
+# This is a safety net in case the app starts before DB setup is complete.
 @app.before_request
 def check_databases():
-    # Verify the database tables exist before each request
+    # Verify database tables periodically instead of every request.
+    global last_db_check_at
+    if time.time() - last_db_check_at < DB_CHECK_INTERVAL_SECONDS:
+        return
+
     try:
         auth_conn = auth.get_db()
         auth_cursor = auth_conn.cursor()
@@ -111,9 +136,14 @@ def check_databases():
             room.init_room_db()
             logger.info("Room database initialized before request")
         room_conn.close()
+        last_db_check_at = time.time()
     except Exception as e:
         logger.error(f"Database check error: {str(e)}")
 
+# Main home page behavior:
+# 1) If user is not signed in, send them to login.
+# 2) If they came from a room challenge, preload that question.
+# 3) Only preload when the user is actually a member of that room.
 @app.route('/')
 def index():
     """Render the main application page or redirect to login"""
@@ -169,6 +199,10 @@ def rooms():
     user_rooms = room.get_user_rooms(user_id)
     return render_template('room.html', rooms=user_rooms)
 
+# Room creation flow:
+# - Read room details from the form
+# - Create a room for the signed-in user
+# - Verify creation succeeded before showing success message
 @app.route('/rooms/create', methods=['GET', 'POST'])
 @login_required
 def create_room():
@@ -188,9 +222,6 @@ def create_room():
             # Create room
             new_room = room.create_room(user_id, room_name, difficulty, topic)
             
-            # Add a delay to ensure database writes are complete
-            time.sleep(0.5)
-            
             # Verify room was created successfully
             verification = room.get_room_by_code(new_room['room_code'])
             if verification:
@@ -208,6 +239,10 @@ def create_room():
     
     return render_template('create_room.html')
 
+# Join flow supports:
+# - Form submission (manual room code entry)
+# - Direct link join (?code=XXXX)
+# In both cases, user is added as a room member before redirect.
 @app.route('/rooms/join', methods=['GET', 'POST'])
 @login_required
 def join_room_route():
@@ -335,8 +370,6 @@ def room_detail(room_code):
         flash(f'Error accessing room: {str(e)}', 'error')
         return redirect(url_for('rooms'))
 
-## Fix the profile update route in app.py
-
 @app.route('/api/profile/update', methods=['POST'])
 @login_required
 def api_update_profile():
@@ -365,8 +398,6 @@ def api_update_profile():
         user_id = session.get('user_id')
         
         # Update the profile
-        # *** FIXED FUNCTION CALL - use regular function call instead of static method ***
-        import auth  # Make sure auth is imported
         success, message = auth.update_user_profile(user_id, username, email)
         
         if success:
@@ -410,7 +441,7 @@ def api_update_room_settings(room_id):
         topic = data.get('topic')
         
         # Validate difficulty
-        if difficulty and difficulty not in ['easy', 'medium', 'hard']:
+        if difficulty and difficulty not in VALID_DIFFICULTIES:
             return jsonify({
                 'success': False,
                 'error': 'Invalid difficulty level'
@@ -477,7 +508,7 @@ def api_assign_question(room_id):
         difficulty = data.get('difficulty', 'medium')
         topic = data.get('topic')
         
-        if difficulty not in ['easy', 'medium', 'hard']:
+        if difficulty not in VALID_DIFFICULTIES:
             return jsonify({'success': False, 'error': 'Invalid difficulty level'}), 400
         
         # Get current user
@@ -598,16 +629,11 @@ def api_room_submit_solution(room_id):
         if not code:
             return jsonify({'success': False, 'error': 'No code provided'}), 400
             
-        if len(code) > 50000:  # 50KB limit
+        if len(code) > MAX_CODE_SIZE:
             return jsonify({'success': False, 'error': 'Code submission too large'}), 400
             
         # Sanitize user code - prevent malicious imports
-        if any(pattern in code for pattern in [
-            "import os", "import subprocess", "import sys", 
-            "from os import", "from subprocess import", "from sys import",
-            "__import__('os')", "__import__('subprocess')", 
-            "eval(", "exec("
-        ]):
+        if _is_restricted_code(code):
             return jsonify({
                 'success': False,
                 'error': 'Code contains restricted imports or functions'
@@ -986,7 +1012,7 @@ def generate_question():
         difficulty = data.get('difficulty', 'medium')
         topic = data.get('topic')
         
-        if difficulty not in ['easy', 'medium', 'hard']:
+        if difficulty not in VALID_DIFFICULTIES:
             return jsonify({'success': False, 'error': 'Invalid difficulty level'}), 400
         
         try:
@@ -1070,16 +1096,11 @@ def submit_solution():
             return jsonify({'success': False, 'error': 'No code provided'}), 400
             
         # Validate code length
-        if len(code) > 50000:  # 50KB limit
+        if len(code) > MAX_CODE_SIZE:
             return jsonify({'success': False, 'error': 'Code submission too large'}), 400
             
         # Sanitize user code - prevent malicious imports
-        if any(pattern in code for pattern in [
-            "import os", "import subprocess", "import sys", 
-            "from os import", "from subprocess import", "from sys import",
-            "__import__('os')", "__import__('subprocess')", 
-            "eval(", "exec("
-        ]):
+        if _is_restricted_code(code):
             return jsonify({
                 'success': False,
                 'error': 'Code contains restricted imports or functions'
@@ -1212,8 +1233,13 @@ def update_user_stats_on_success():
         except Exception as e:
             logger.error(f"Error updating user stats: {e}")
 
-def execute_code_simplified(user_code: str, function_name: str, test_code: str, timeout: int = 5) -> Dict[str, Any]:
-    """
+# Runs user code in an isolated temporary file and executes generated tests.
+# Safety controls used here:
+# - input validation
+# - timeout limits
+# - subprocess execution (separate process)
+# - cleanup of temp files in all cases
+def execute_code_simplified(user_code: str, function_name: str, test_code: str, timeout: int = 5) -> Dict[str, Any]:    """
     Execute the user's code and run tests with simplified security measures
     that are more likely to work across platforms.
     """
@@ -1245,7 +1271,10 @@ def execute_code_simplified(user_code: str, function_name: str, test_code: str, 
         # Write files with proper encoding and error handling
         code_file.write_text(user_code, encoding='utf-8')
         
-        # Create test file with simplified safety measures
+# Create a temporary Python test runner script that:
+# - imports the user's function/class
+# - runs generated tests
+# - returns machine-readable JSON results
         test_code_content = [
             "import sys",
             "import signal",
@@ -1299,7 +1328,7 @@ def execute_code_simplified(user_code: str, function_name: str, test_code: str, 
             timeout=timeout,
             env={**os.environ, 'PYTHONPATH': str(temp_dir)},
         )
-        
+        # If test script exits with non-zero code, treat as execution failure and return a safe, shortened error payload to the frontend.
         if result.returncode != 0:
             return {
                 'success': False,
@@ -2387,14 +2416,12 @@ def inject_user_stats():
 def validate_request():
     """Validate incoming requests"""
     if request.method == 'POST':
-        # Skip validation for non-API endpoints
-        if (request.endpoint and not request.endpoint.startswith('api_') and
-            request.endpoint not in ['login', 'register', 'index', 'create_room', 'join_room_route']):
-            if not request.is_json and request.endpoint.startswith('api/'):
-                return jsonify({
-                    'success': False,
-                    'error': 'Content-Type must be application/json'
-                }), 400
+        is_api_request = request.path.startswith('/api/')
+        if is_api_request and not request.is_json:
+            return jsonify({
+                'success': False,
+                'error': 'Content-Type must be application/json'
+            }), 400
         
         if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
             return jsonify({
